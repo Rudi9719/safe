@@ -1,0 +1,817 @@
+/*****************************************************************************
+ * Author:   Valient Gough <vgough@pobox.com>
+ *
+ *****************************************************************************
+ * Copyright (c) 2004, Valient Gough
+ *
+ * This program is free software; you can distribute it and/or modify it under
+ * the terms of the GNU General Public License (GPL), as published by the Free
+ * Software Foundation; either version 2 of the License, or (at your option)
+ * any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+ * more details.
+ */
+
+#include "base/config.h"
+
+#include "base/autosprintf.h"
+#include "base/i18n.h"
+#include "base/logging.h"
+#include "base/Error.h"
+
+#include "cipher/CipherV1.h"
+#include "cipher/BlockCipher.h"
+#include "cipher/MAC.h"
+#include "cipher/StreamCipher.h"
+
+// TODO: get rid of all the following includes
+// in preference of use EncfsFsIO.h only
+#include "fs/FileUtils.h"
+#include "fs/Context.h"
+#include "fs/FileNode.h"
+#include "fs/DirNode.h"
+
+#include "encfs/EncfsPasswordReader.h"
+#include "encfs/PosixFsIO.h"
+
+#include <getopt.h>
+
+#include <iostream>
+#include <list>
+#include <memory>
+#include <string>
+
+#include <cstdio>
+
+#include <fcntl.h>
+#include <unistd.h>
+
+#include <sys/param.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+
+using namespace encfs;
+using gnu::autosprintf;
+using std::cerr;
+using std::cin;
+using std::cout;
+using std::endl;
+using std::shared_ptr;
+using std::string;
+using std::vector;
+
+static shared_ptr<FsIO> g_fs_io;
+
+static int showInfo(int argc, char **argv);
+static int showVersion(int argc, char **argv);
+static int showCiphers(int argc, char **argv);
+static int chpasswd(int argc, char **argv);
+static int chpasswdAutomaticly(int argc, char **argv);
+static int cmd_ls(int argc, char **argv);
+static int cmd_decode(int argc, char **argv);
+static int cmd_encode(int argc, char **argv);
+static int cmd_showcruft(int argc, char **argv);
+static int cmd_cat(int argc, char **argv);
+static int cmd_export(int argc, char **argv);
+static int cmd_showKey(int argc, char **argv);
+
+struct CommandOpts {
+  const char *name;
+  int minOptions;
+  int maxOptions;
+  int (*func)(int argc, char **argv);
+  const char *argStr;
+  const char *usageStr;
+} commands[] = {{"info",                               1,            1,
+                 showInfo,                             "(root dir)",
+                 // xgroup(usage)
+                 gettext_noop("  -- show information")},
+                {"showKey",                    1, 1, cmd_showKey, "(root dir)",
+                 // xgroup(usage)
+                 gettext_noop("  -- show key")},
+                {"passwd",                                       1, 1, chpasswd,
+                 "(root dir)",
+                 // xgroup(usage)
+                 gettext_noop("  -- change password for volume")},
+                {"autopasswd", 1, 1, chpasswdAutomaticly, "(root dir)",
+                 // xgroup(usage)
+                 gettext_noop(
+                     "  -- change password for volume, taking password"
+                     " from standard input.\n\tNo prompts are issued.")},
+                {"ls", 1, 2, cmd_ls, 0, 0},
+                {"showcruft",
+                 1,
+                 1,
+                 cmd_showcruft,
+                 "(root dir)",
+                 // xgroup(usage)
+                 gettext_noop("  -- show undecodable filenames in the volume")},
+                {"cat", 2, 2, cmd_cat, "(root dir) path",
+                 // xgroup(usage)
+                 gettext_noop(
+                     "  -- decodes the file and cats it to standard out")},
+                {"decode", 1, 100, cmd_decode,
+                 "[--extpass=prog] (root dir) [encoded-name ...]",
+                 // xgroup(usage)
+                 gettext_noop(
+                     "  -- decodes name and prints plaintext version")},
+                {"encode",
+                 1,
+                 100,
+                 cmd_encode,
+                 "[--extpass=prog] (root dir) [plaintext-name ...]",
+                 // xgroup(usage)
+                 gettext_noop("  -- encodes a filename and print result")},
+                {"export", 2, 2, cmd_export, "(root dir) path",
+                 // xgroup(usage)
+                 gettext_noop(
+                     "  -- decrypts a volume and writes results to path")},
+                {"ciphers",                                  0,  0,
+                 showCiphers,                                "",
+                 // xgroup(usage)
+                 gettext_noop("  -- show available ciphers")},
+                {"version",                                         0,  0,
+                 showVersion,                                       "",
+                 // xgroup(usage)
+                 gettext_noop("  -- print version number and exit")},
+                {0, 0, 0, 0, 0, 0}};
+
+static void usage(const char *name) {
+  cerr << autosprintf(_("encfsctl version %s"), VERSION) << "\n"
+       << _("Usage:\n");
+
+  int offset = 0;
+  while (commands[offset].name != 0) {
+    if (commands[offset].argStr != 0) {
+      cerr << "encfsctl " << commands[offset].name << " "
+           << commands[offset].argStr << "\n"
+           << gettext(commands[offset].usageStr) << "\n";
+    }
+    ++offset;
+  }
+
+  cerr << "\n"
+      // xgroup(usage)
+       << autosprintf(_("Example: \n%s info ~/.crypt\n"), name) << "\n";
+}
+
+static bool checkDir(string &rootDir) {
+  if (!isDirectory(g_fs_io, rootDir.c_str())) {
+    cout << autosprintf(_("directory %s does not exist.\n"), rootDir.c_str());
+    return false;
+  }
+  if (rootDir[rootDir.length() - 1] != '/') rootDir.append("/");
+
+  return true;
+}
+
+static int showVersion(int argc, char **argv) {
+  (void)argc;
+  (void)argv;
+  // xgroup(usage)
+  cout << autosprintf(_("encfsctl version %s"), VERSION) << "\n";
+
+  return EXIT_SUCCESS;
+}
+
+static int showCiphers(int argc, char **argv) {
+  (void)argc;
+  (void)argv;
+
+  cout << _("Block modes:\n");
+  for (const string &name : BlockCipher::GetRegistry().GetAll()) {
+    auto props = BlockCipher::GetRegistry().GetProperties(name.c_str());
+    cout << _("Implementation: ") << name << "\n";
+    cout << "\t" << _("Provider: ") << props->library << "\n";
+    cout << "\t" << _("Block cipher: ") << props->cipher << " / " << props->mode
+         << "\n";
+    cout << "\t" << _("Key Sizes: ") << props->keySize << "\n";
+  }
+  cout << "\n";
+
+  cout << _("Stream modes:\n");
+  for (const string &name : StreamCipher::GetRegistry().GetAll()) {
+    auto props = StreamCipher::GetRegistry().GetProperties(name.c_str());
+    cout << _("Implementation: ") << name << "\n";
+    cout << "\t" << _("Provider: ") << props->library << "\n";
+    cout << "\t" << _("Stream cipher: ") << props->cipher << " / "
+         << props->mode << "\n";
+    cout << "\t" << _("Key Sizes: ") << props->keySize << "\n";
+  }
+  cout << "\n";
+
+  cout << _("MAC modes:\n");
+  for (const string &name : MAC::GetRegistry().GetAll()) {
+    auto props = MAC::GetRegistry().GetProperties(name.c_str());
+    cout << _("Implementation: ") << name << "\n";
+    cout << "\t" << _("Provider: ") << props->library << "\n";
+    cout << "\t" << _("Hash mode: ") << props->hashFunction << " / "
+         << props->mode << "\n";
+    cout << "\t" << _("Block size: ") << props->blockSize << "\n";
+  }
+  cout << "\n";
+
+  cout << _("PBKDF modes:\n");
+  for (const string &name : PBKDF::GetRegistry().GetAll()) {
+    auto props = PBKDF::GetRegistry().GetProperties(name.c_str());
+    cout << _("Implementation: ") << name << "\n";
+    cout << "\t" << _("Provider: ") << props->library << "\n";
+    cout << "\t" << _("Mode: ") << props->mode << "\n";
+  }
+  cout << "\n";
+
+  return EXIT_SUCCESS;
+}
+
+static int showInfo(int argc, char **argv) {
+  (void)argc;
+  string rootDir = argv[1];
+  if (!checkDir(rootDir)) return EXIT_FAILURE;
+
+  EncfsConfig config;
+  ConfigType type = readConfig(g_fs_io, rootDir, config);
+
+  // show information stored in config..
+  switch (type) {
+    case Config_None:
+      // xgroup(diag)
+      cout << _("Unable to load or parse config file\n");
+      return EXIT_FAILURE;
+    case Config_Prehistoric:
+      // xgroup(diag)
+      cout << _("A really old EncFS filesystem was found. \n"
+                "It is not supported in this EncFS build.\n");
+      return EXIT_FAILURE;
+    case Config_V3:
+      // xgroup(diag)
+      cout << "\n" << autosprintf(_("Version 3 configuration; "
+                                    "created by %s\n"),
+                                  config.creator().c_str());
+      break;
+    case Config_V4:
+      // xgroup(diag)
+      cout << "\n" << autosprintf(_("Version 4 configuration; "
+                                    "created by %s\n"),
+                                  config.creator().c_str());
+      break;
+    case Config_V5:
+    case Config_V6:
+    case Config_V7:
+      // xgroup(diag)
+      cout << "\n"
+           << autosprintf(_("Version %i configuration; "
+                            "created by %s (revision %i)\n"),
+                          type, config.creator().c_str(), config.revision());
+      break;
+  }
+
+  showFSInfo(config);
+
+  return EXIT_SUCCESS;
+}
+
+static RootPtr initRootInfo(int &argc, char **&argv) {
+  RootPtr result;
+  shared_ptr<EncFS_Opts> opts(new EncFS_Opts());
+  opts->createIfNotFound = false;
+  opts->checkKey = false;
+
+  static struct option long_options[] = {{"extpass", 1, 0, 'p'}, {0, 0, 0, 0}};
+
+  string passwordProgram;
+  for (;;) {
+    int option_index = 0;
+
+    int res = getopt_long(argc, argv, "", long_options, &option_index);
+    if (res == -1) break;
+
+    switch (res) {
+      case 'p':
+        passwordProgram.assign(optarg);
+        break;
+      default:
+        LOG(WARNING) << "getopt error: " << res;
+        break;
+    }
+  }
+
+  argc -= optind;
+  argv += optind;
+
+  if (argc == 0) {
+    cerr << _("Incorrect number of arguments") << "\n";
+  } else {
+    opts->rootDir = string(argv[0]);
+
+    opts->passwordReader = passwordProgram.empty()
+                               ? std::make_shared<EncfsPasswordReader>(false)
+                               : std::make_shared<EncfsPasswordReader>(
+                                     false, passwordProgram, opts->rootDir);
+
+    --argc;
+    ++argv;
+
+    if (checkDir(opts->rootDir)) result = initFS(nullptr, opts);
+
+    if (!result)
+      cerr << _("Unable to initialize encrypted filesystem - check path.\n");
+  }
+
+  return result;
+}
+
+static RootPtr initRootInfo(const char *crootDir) {
+  string rootDir(crootDir);
+  RootPtr result;
+
+  if (checkDir(rootDir)) {
+    shared_ptr<EncFS_Opts> opts(new EncFS_Opts());
+    opts->rootDir = rootDir;
+    opts->createIfNotFound = false;
+    opts->checkKey = false;
+    result = initFS(nullptr, opts);
+  }
+
+  if (!result)
+    cerr << _("Unable to initialize encrypted filesystem - check path.\n");
+
+  return result;
+}
+
+static int cmd_showKey(int /*argc*/, char **argv) {
+  RootPtr rootInfo = initRootInfo(argv[1]);
+
+  if (!rootInfo)
+    return EXIT_FAILURE;
+  else {
+    // encode with itself
+    string b64Key = rootInfo->cipher->encodeAsString(rootInfo->volumeKey);
+
+    cout << b64Key << "\n";
+
+    return EXIT_SUCCESS;
+  }
+}
+
+static int cmd_decode(int argc, char **argv) {
+  RootPtr rootInfo = initRootInfo(argc, argv);
+  if (!rootInfo) return EXIT_FAILURE;
+
+  if (argc > 0) {
+    for (int i = 0; i < argc; ++i) {
+      string name = rootInfo->root->plainPathPosix(argv[i]);
+      cout << name << "\n";
+    }
+  } else {
+    char buf[PATH_MAX + 1];
+    while (cin.getline(buf, PATH_MAX)) {
+      cout << rootInfo->root->plainPathPosix(buf) << "\n";
+    }
+  }
+  return EXIT_SUCCESS;
+}
+
+static int cmd_encode(int argc, char **argv) {
+  RootPtr rootInfo = initRootInfo(argc, argv);
+  if (!rootInfo) return EXIT_FAILURE;
+
+  if (argc > 0) {
+    for (int i = 0; i < argc; ++i) {
+      string name = rootInfo->root->cipherPathWithoutRootPosix(argv[i]);
+      cout << name << "\n";
+    }
+  } else {
+    char buf[PATH_MAX + 1];
+    while (cin.getline(buf, PATH_MAX)) {
+      cout << rootInfo->root->cipherPathWithoutRootPosix(buf) << "\n";
+    }
+  }
+  return EXIT_SUCCESS;
+}
+
+static int cmd_ls(int argc, char **argv) {
+  (void)argc;
+
+  RootPtr rootInfo = initRootInfo(argv[1]);
+
+  if (!rootInfo) return EXIT_FAILURE;
+
+  // show files in directory
+  {
+    auto root = rootInfo->root->rootDirectory();
+    DirTraverse dt = rootInfo->root->openDir(root.c_str());
+    if (dt.valid()) {
+      for (string name = dt.nextPlaintextName(); !name.empty();
+           name = dt.nextPlaintextName()) {
+        auto fullpath = root + '/' + name;
+        shared_ptr<FileNode> fnode =
+            rootInfo->root->lookupNode(fullpath.c_str(), "encfsctl-ls");
+        FsFileAttrs attrs;
+        fnode->getAttr(attrs);
+
+        struct tm stm;
+        time_t mtime = attrs.mtime;
+        localtime_r(&mtime, &stm);
+        stm.tm_year += 1900;
+        // TODO: when I add "%s" to the end and name.c_str(), I get a
+        // seg fault from within strlen.  Why ???
+        printf("%11i %4i-%02i-%02i %02i:%02i:%02i %s\n", int(attrs.size),
+               int(stm.tm_year), int(stm.tm_mon), int(stm.tm_mday),
+               int(stm.tm_hour), int(stm.tm_min), int(stm.tm_sec),
+               name.c_str());
+      }
+    }
+  }
+
+  return EXIT_SUCCESS;
+}
+
+// apply an operation to every block in the file
+template <typename T>
+int processContents(const shared_ptr<EncFS_Root> &rootInfo, const char *path,
+                    T &op) {
+  int errCode = 0;
+  bool requestWrite = false;
+  bool createFile = false;
+  auto node = rootInfo->root->openNode(path, "encfsctl", requestWrite,
+                                       createFile, &errCode);
+
+  if (!node) {
+    // try treating filename as an enciphered path
+    string plainName = (rootInfo->root->rootDirectory() + '/' +
+                        rootInfo->root->plainPathPosix(path));
+    node = rootInfo->root->lookupNode(plainName.c_str(), "encfsctl");
+    if (node) {
+      const bool requestWrite = false;
+      const bool create = false;
+      errCode = node->open(requestWrite, create);
+      if (errCode < 0) node.reset();
+    }
+  }
+
+  if (!node) {
+    cerr << "unable to open " << path << "\n";
+    return errCode;
+  } else {
+    unsigned char buf[512];
+    int blocks = (node->getSize() + sizeof(buf) - 1) / sizeof(buf);
+    // read all the data in blocks
+    for (int i = 0; i < blocks; ++i) {
+      int bytes = node->read(i * sizeof(buf), buf, sizeof(buf));
+      int res = op(buf, bytes);
+      if (res < 0) return res;
+    }
+  }
+  return 0;
+}
+
+class WriteOutput {
+  int _fd;
+
+ public:
+  WriteOutput(int fd) { _fd = fd; }
+  ~WriteOutput() { close(_fd); }
+
+  int operator()(const void *buf, int count) {
+    return (int)write(_fd, buf, count);
+  }
+};
+
+static int cmd_cat(int argc, char **argv) {
+  (void)argc;
+  RootPtr rootInfo = initRootInfo(argv[1]);
+
+  if (!rootInfo) return EXIT_FAILURE;
+
+  string path = rootInfo->root->rootDirectory();
+  if (argv[2][0] != '/') path += '/';
+  path += argv[2];
+  WriteOutput output(STDOUT_FILENO);
+  int errCode = processContents(rootInfo, path.c_str(), output);
+
+  return errCode;
+}
+
+static int copyLink(const struct stat &stBuf,
+                    const shared_ptr<EncFS_Root> &rootInfo, const string &cpath,
+                    const string &destName) {
+  vector<char> buf(stBuf.st_size + 1, 0);
+  int res = ::readlink(cpath.c_str(), &buf[0], stBuf.st_size);
+  if (res == -1) {
+    cerr << "unable to readlink of " << cpath << "\n";
+    return EXIT_FAILURE;
+  }
+
+  buf[res] = '\0';
+  string decodedLink = rootInfo->root->plainPathPosix(&buf[0]);
+
+  res = ::symlink(decodedLink.c_str(), destName.c_str());
+  if (res == -1) {
+    cerr << "unable to create symlink for " << cpath << " to " << decodedLink
+         << "\n";
+  }
+
+  return EXIT_SUCCESS;
+}
+
+static int copyContents(const shared_ptr<EncFS_Root> &rootInfo,
+                        const char *encfsName, const char *targetName) {
+  shared_ptr<FileNode> node = rootInfo->root->lookupNode(encfsName, "encfsctl");
+
+  if (!node) {
+    cerr << "unable to open " << encfsName << "\n";
+    return EXIT_FAILURE;
+  } else {
+    FsFileAttrs attrs;
+
+    if (node->getAttr(attrs) != 0) return EXIT_FAILURE;
+
+    if (attrs.posix && S_ISLNK(attrs.posix->mode)) {
+      string d = rootInfo->root->cipherPath(encfsName);
+      char linkContents[PATH_MAX + 2];
+
+      if (readlink(d.c_str(), linkContents, PATH_MAX + 1) <= 0) {
+        cerr << "unable to read link " << encfsName << "\n";
+        return EXIT_FAILURE;
+      }
+      symlink(rootInfo->root->plainPathPosix(linkContents).c_str(), targetName);
+    } else {
+      mode_t mode = attrs.posix
+                        ? attrs.posix->mode
+                        : attrs.type == FsFileType::DIRECTORY ? 0777 : 0666;
+      int outfd = creat(targetName, mode);
+
+      WriteOutput output(outfd);
+      processContents(rootInfo, encfsName, output);
+    }
+  }
+  return EXIT_SUCCESS;
+}
+
+static bool endsWith(const string &str, char ch) {
+  if (str.empty())
+    return false;
+  else
+    return str[str.length() - 1] == ch;
+}
+
+static int traverseDirs(const shared_ptr<EncFS_Root> &rootInfo,
+                        string volumeDir, string destDir) {
+  if (!endsWith(volumeDir, '/')) volumeDir.append("/");
+  if (!endsWith(destDir, '/')) destDir.append("/");
+
+  // Lookup directory node so we can create a destination directory
+  // with the same permissions
+  {
+    FsFileAttrs attrs;
+    shared_ptr<FileNode> dirNode =
+        rootInfo->root->lookupNode(volumeDir.c_str(), "encfsctl");
+    if (dirNode->getAttr(attrs)) return EXIT_FAILURE;
+
+    mode_t mode = attrs.posix ? attrs.posix->mode : 0777;
+    mkdir(destDir.c_str(), mode);
+  }
+
+  // show files in directory
+  DirTraverse dt = rootInfo->root->openDir(volumeDir.c_str());
+  if (dt.valid()) {
+    for (string name = dt.nextPlaintextName(); !name.empty();
+         name = dt.nextPlaintextName()) {
+      // Recurse to subdirectories
+      if (name != "." && name != "..") {
+        string plainPath = volumeDir + name;
+        string cpath = rootInfo->root->cipherPath(plainPath.c_str());
+        string destName = destDir + name;
+
+        int r = EXIT_SUCCESS;
+        struct stat stBuf;
+        if (!lstat(cpath.c_str(), &stBuf)) {
+          if (S_ISDIR(stBuf.st_mode)) {
+            traverseDirs(rootInfo, (plainPath + '/').c_str(), destName + '/');
+          } else if (S_ISLNK(stBuf.st_mode)) {
+            r = copyLink(stBuf, rootInfo, cpath, destName);
+          } else {
+            r = copyContents(rootInfo, plainPath.c_str(), destName.c_str());
+          }
+        } else {
+          r = EXIT_FAILURE;
+        }
+
+        if (r != EXIT_SUCCESS) return r;
+      }
+    }
+  }
+  return EXIT_SUCCESS;
+}
+
+static int cmd_export(int argc, char **argv) {
+  (void)argc;
+
+  RootPtr rootInfo = initRootInfo(argv[1]);
+
+  if (!rootInfo) return EXIT_FAILURE;
+
+  string destDir = argv[2];
+  // if the dir doesn't exist, then create it (with user permission)
+  if (!checkDir(destDir) && !userAllowMkdir(g_fs_io, destDir.c_str(), 0700))
+    return EXIT_FAILURE;
+
+  return traverseDirs(rootInfo, rootInfo->root->rootDirectory(), destDir);
+}
+
+int showcruft(const shared_ptr<EncFS_Root> &rootInfo, const char *dirName) {
+  int found = 0;
+  DirTraverse dt = rootInfo->root->openDir(dirName);
+  if (dt.valid()) {
+    bool showedDir = false;
+    for (string name = dt.nextInvalid(); !name.empty();
+         name = dt.nextInvalid()) {
+      string cpath = rootInfo->root->cipherPath(dirName);
+      cpath += '/';
+      cpath += name;
+
+      if (!showedDir) {
+        // just before showing a list of files in a directory
+        cout << autosprintf(_("In directory %s: \n"), dirName);
+        showedDir = true;
+      }
+      ++found;
+      cout << cpath << "\n";
+    }
+
+    // now go back and look for directories to recurse into..
+    dt = rootInfo->root->openDir(dirName);
+    if (dt.valid()) {
+      for (string name = dt.nextPlaintextName(); !name.empty();
+           name = dt.nextPlaintextName()) {
+        if (name == "." || name == "..") continue;
+
+        string plainPath = dirName;
+        plainPath += '/';
+        plainPath += name;
+
+        string cpath = rootInfo->root->cipherPath(plainPath.c_str());
+
+        if (isDirectory(g_fs_io, cpath.c_str()))
+          found += showcruft(rootInfo, plainPath.c_str());
+      }
+    }
+  }
+
+  return found;
+}
+
+/*
+    iterate recursively through the filesystem and print out names of files
+    which have filenames which cannot be decoded with the given key..
+ */
+static int cmd_showcruft(int argc, char **argv) {
+  (void)argc;
+
+  RootPtr rootInfo = initRootInfo(argv[1]);
+
+  if (!rootInfo) return EXIT_FAILURE;
+
+  int filesFound = showcruft(rootInfo, rootInfo->root->rootDirectory().c_str());
+
+  cout << autosprintf("Found %i invalid file(s).", filesFound) << "\n";
+
+  return EXIT_SUCCESS;
+}
+
+static int do_chpasswd(bool useStdin, bool annotate, int argc, char **argv) {
+  (void)argc;
+  string rootDir = argv[1];
+  if (!checkDir(rootDir)) return EXIT_FAILURE;
+
+  EncfsConfig config;
+  ConfigType cfgType = readConfig(g_fs_io, rootDir, config);
+
+  if (cfgType == Config_None) {
+    cout << _("Unable to load or parse config file\n");
+    return EXIT_FAILURE;
+  }
+
+  auto passwordReader = std::make_shared<EncfsPasswordReader>(useStdin);
+
+  // ask for existing password
+  cout << _("Enter current Encfs password\n");
+  if (annotate) cerr << "$PROMPT$ passwd" << endl;
+  CipherKey userKey = getUserKey(config, passwordReader);
+  if (!userKey.valid()) return EXIT_FAILURE;
+
+  // instanciate proper cipher
+  shared_ptr<CipherV1> cipher = getCipher(config);
+  if (!cipher) {
+    cout << autosprintf(_("Unable to find specified cipher \"%s\"\n"),
+                        config.cipher().name().c_str());
+    return EXIT_FAILURE;
+  }
+  cipher->setKey(userKey);
+
+  // decode volume key using user key -- at this point we detect an incorrect
+  // password if the key checksum does not match (causing readKey to fail).
+  CipherKey volumeKey = cipher->readKey(
+      (const unsigned char *)config.key().ciphertext().data(), true);
+
+  if (!volumeKey.valid()) {
+    cout << _("Invalid password\n");
+    return EXIT_FAILURE;
+  }
+
+  cipher->setKey(volumeKey);
+
+  // Now, get New user key..
+  userKey.reset();
+  cout << _("Enter new Encfs password\n");
+
+  // create new key
+  if (useStdin) {
+    if (annotate) cerr << "$PROMPT$ new_passwd" << endl;
+  }
+
+  userKey = getNewUserKey(config, passwordReader);
+
+  // re-encode the volume key using the new user key and write it out..
+  int result = EXIT_FAILURE;
+  if (userKey.valid()) {
+    int encodedKeySize = cipher->encodedKeySize();
+    unsigned char *keyBuf = new unsigned char[encodedKeySize];
+
+    // encode volume key with new user key
+    cipher->setKey(userKey);
+    cipher->writeKey(volumeKey, keyBuf);
+    userKey.reset();
+    cipher->setKey(volumeKey);
+
+    EncryptedKey *key = config.mutable_key();
+    key->set_ciphertext(keyBuf, encodedKeySize);
+    delete[] keyBuf;
+
+    if (saveConfig(g_fs_io, rootDir, config)) {
+      // password modified -- changes volume key of filesystem..
+      cout << _("Volume Key successfully updated.\n");
+      result = EXIT_SUCCESS;
+    } else {
+      cout << _("Error saving modified config file.\n");
+    }
+  } else {
+    cout << _("Error creating key\n");
+  }
+
+  volumeKey.reset();
+
+  return result;
+}
+
+static int chpasswd(int argc, char **argv) {
+  return do_chpasswd(false, false, argc, argv);
+}
+
+static int chpasswdAutomaticly(int argc, char **argv) {
+  return do_chpasswd(true, false, argc, argv);
+}
+
+int main(int argc, char **argv) {
+  /* TODO: make this X-Platform */
+  g_fs_io = std::make_shared<PosixFsIO>();
+
+#ifdef LOCALEDIR
+  setlocale(LC_ALL, "");
+  bindtextdomain(PACKAGE, LOCALEDIR);
+  textdomain(PACKAGE);
+#endif
+
+  bool isThreaded = false;
+  CipherV1::init(isThreaded);
+
+  if (argc < 2) {
+    usage(argv[0]);
+    return EXIT_FAILURE;
+  }
+
+  // find the specified command
+  int offset = 0;
+  while (commands[offset].name != 0) {
+    if (!strcmp(argv[1], commands[offset].name)) break;
+    ++offset;
+  }
+
+  if (commands[offset].name == 0) {
+    cerr << autosprintf(_("invalid command: \"%s\""), argv[1]) << "\n";
+  } else {
+    if ((argc - 2 < commands[offset].minOptions) ||
+        (argc - 2 > commands[offset].maxOptions)) {
+      cerr << autosprintf(_("Incorrect number of arguments for command \"%s\""),
+                          argv[1]) << "\n";
+    } else
+      return (*commands[offset].func)(argc - 1, argv + 1);
+  }
+
+  CipherV1::shutdown(isThreaded);
+
+  return EXIT_FAILURE;
+}

@@ -1,0 +1,1 @@
+LDFLAGS=-XCClinker -stdlib=libc++ CXX=clang++ CC=clang CXXFLAGS=-stdlib=libc++ ./configure --prefix /Users/rian/encfs-dev-prefix/

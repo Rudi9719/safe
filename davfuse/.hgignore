@@ -1,0 +1,5 @@
+syntax: glob
+
+out
+out-release
+*~

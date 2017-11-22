@@ -1,0 +1,120 @@
+
+/*****************************************************************************
+ * Author:   Valient Gough <vgough@pobox.com>
+ *
+ *****************************************************************************
+ * Copyright (c) 2012 Valient Gough
+ *
+ * This program is free software: you can redistribute it and/or modify it under
+ * the terms of the GNU Lesser General Public License as published by the Free
+ * Software Foundation, either version 3 of the License, or (at your option) any
+ * later version.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+ * FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public License for more
+ * details.
+ *
+ * You should have received a copy of the GNU Lesser General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#include "fs/testing.h"
+
+#include "fs/CipherFileIO.h"
+#include "fs/FileUtils.h"
+#include "fs/FSConfig.h"
+#include "fs/MACFileIO.h"
+#include "fs/MemFileIO.h"
+
+#include "cipher/MemoryPool.h"
+
+#include <gtest/gtest.h>
+
+#include <list>
+#include <memory>
+
+using std::shared_ptr;
+
+using namespace encfs;
+
+namespace {
+
+TEST(MemIOTest, BasicIO) {
+  MemFileIO io(1024);
+  ASSERT_EQ(1024, io.get_attrs().size);
+
+  MemBlock mb;
+  mb.allocate(256);
+
+  IORequest req;
+  req.offset = 0;
+  req.data = mb.data;
+  req.dataLen = 256;
+
+  for (int i = 0; i < 4; i++) {
+    req.offset = i * 256;
+    memset(req.data, 0, req.dataLen);
+    ASSERT_NO_THROW(io.write(req));
+  }
+
+  for (int i = 0; i < 4; i++) {
+    req.offset = i * 256;
+    ASSERT_EQ(req.dataLen, io.read(req));
+  }
+}
+
+void testMacIO(FSConfigPtr& cfg) {
+  shared_ptr<MemFileIO> base(new MemFileIO(0));
+  shared_ptr<MACFileIO> test(new MACFileIO(base, cfg));
+
+  shared_ptr<MemFileIO> dup(new MemFileIO(0));
+  comparisonTest(cfg, test.get(), dup.get());
+}
+
+TEST(IOTest, NullMacIO) { runWithCipher("Null", 512, testMacIO); }
+
+TEST(IOTest, MacIO) { runWithAllCiphers(testMacIO); }
+
+void testBasicCipherIO(FSConfigPtr& cfg) {
+  shared_ptr<MemFileIO> base(new MemFileIO(0));
+  shared_ptr<CipherFileIO> test(new CipherFileIO(base, cfg));
+
+  byte buf[1024];
+  cfg->cipher->pseudoRandomize(buf, sizeof(buf));
+
+  IORequest req;
+  req.data = new byte[sizeof(buf)];
+  req.offset = 0;
+  req.dataLen = sizeof(buf);
+
+  memcpy(req.data, buf, sizeof(buf));
+  ASSERT_NO_THROW(test->write(req));
+
+  memset(req.data, 0, sizeof(buf));
+  ASSERT_EQ(req.dataLen, test->read(req));
+
+  for (unsigned int i = 0; i < sizeof(buf); ++i) {
+    bool match = (buf[i] == req.data[i]);
+    ASSERT_TRUE(match) << "mismatched data at offset " << i;
+    if (!match) break;
+  }
+
+  delete[] req.data;
+}
+
+TEST(IOTest, BasicCipherFileIO) { runWithAllCiphers(testBasicCipherIO); }
+
+void testCipherIO(FSConfigPtr& cfg) {
+  shared_ptr<MemFileIO> base(new MemFileIO(0));
+  shared_ptr<CipherFileIO> test(new CipherFileIO(base, cfg));
+
+  shared_ptr<MemFileIO> dup(new MemFileIO(0));
+  comparisonTest(cfg, test.get(), dup.get());
+}
+
+TEST(IOTest, NullCipherFileIO) { runWithCipher("Null", 512, testCipherIO); }
+
+TEST(IOTest, CipherFileIO) { runWithAllCiphers(testCipherIO); }
+
+}  // namespace

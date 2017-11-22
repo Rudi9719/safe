@@ -1,0 +1,63 @@
+protobuf_generate_cpp (PROTO_SRCS PROTO_HDRS ${PROJECT_SOURCE_DIR}/protos/fsconfig.proto)
+
+include_directories (${PROJECT_BINARY_DIR}/base)
+add_library (encfs-fs
+    Context.cpp
+    FileIO.cpp
+    BlockFileIO.cpp
+    CipherFileIO.cpp
+    MACFileIO.cpp
+    NameIO.cpp
+    StreamNameIO.cpp
+    BlockNameIO.cpp
+    NullNameIO.cpp
+    DirNode.cpp
+    FileNode.cpp
+    FileUtils.cpp
+    FsIO.cpp
+    PasswordReader.cpp
+    EncfsFsIO.cpp
+    ${PROTO_SRCS}
+    ${PROTO_HDRS}
+)
+
+target_link_libraries (encfs-fs
+    ${CMAKE_THREAD_LIBS_INIT} #  for protobuf
+    ${PROTOBUF_LIBRARY}
+)
+
+add_executable (checkops
+    checkops.cpp
+)
+target_link_libraries (checkops
+    encfs-fs
+    encfs-cipher
+    encfs-base
+)
+
+# Unit tests are optional, depends on libgtest (Google's C++ test framework).
+if (GTEST_FOUND)
+    link_directories (${PROJECT_BINARY_DIR}/base)
+    link_directories (${PROJECT_BINARY_DIR}/cipher)
+
+    include_directories (${GTEST_INCLUDE_DIR})
+
+    file (GLOB TEST_FILES "*_test.cpp")
+
+    add_executable (fs-tests
+        MemBlockFileIO.cpp
+        MemFileIO.cpp
+        testing.cpp
+        ${TEST_FILES}
+    )
+
+    target_link_libraries (fs-tests
+        ${GTEST_BOTH_LIBRARIES}
+        encfs-fs
+        encfs-cipher
+        encfs-base
+    )
+
+    add_test (FSTests fs-tests)
+    GTEST_ADD_TESTS (fs-tests "${FSTestArgs}" ${TEST_FILES})
+endif (GTEST_FOUND)
