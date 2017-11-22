@@ -1,3 +1,0 @@
-LIBRARY powrprof.dll
-EXPORTS
-GetPwrCapabilities@4

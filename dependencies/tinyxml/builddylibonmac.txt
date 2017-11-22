@@ -1,1 +1,0 @@
-clang++ -o libtinyxml.dylib -dylinker_install_name libtinyxml.dylib -shared tinystr.cpp tinyxml.cpp tinyxmlerror.cpp tinyxmlparser.cpp
